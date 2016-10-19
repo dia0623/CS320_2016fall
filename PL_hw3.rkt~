@@ -1,0 +1,110 @@
+#lang plai
+
+(require (for-syntax racket/base) racket/match racket/list racket/string
+         (only-in mzlib/string read-from-string-all))
+
+;; build a regexp that matches restricted character expressions, can use only
+;; {}s for lists, and limited strings that use '...' (normal racket escapes
+;; like \n, and '' for a single ')
+(define good-char "(?:[ \t\r\na-zA-Z0-9_{}!?*/<=>:+-]|[.][.][.])")
+;; this would make it awkward for students to use \" for strings
+;; (define good-string "\"[^\"\\]*(?:\\\\.[^\"\\]*)*\"")
+(define good-string "[^\"\\']*(?:''[^\"\\']*)*")
+(define expr-re
+  (regexp (string-append "^"
+                         good-char"*"
+                         "(?:'"good-string"'"good-char"*)*"
+                         "$")))
+(define string-re
+  (regexp (string-append "'("good-string")'")))
+
+(define (string->sexpr str)
+  (unless (string? str)
+    (error 'string->sexpr "expects argument of type <string>"))
+    (unless (regexp-match expr-re str)
+      (error 'string->sexpr "syntax error (bad contents)"))
+    (let ([sexprs (read-from-string-all
+                 (regexp-replace*
+                  "''" (regexp-replace* string-re str "\"\\1\"") "'"))])
+    (if (= 1 (length sexprs))
+      (car sexprs)
+      (error 'string->sexpr "bad syntax (multiple expressions)"))))
+
+(test/exn (string->sexpr 1) "expects argument of type <string>")
+(test/exn (string->sexpr ".") "syntax error (bad contents)")
+(test/exn (string->sexpr "{} {}") "bad syntax (multiple expressions)")
+
+;; WAE abstract syntax trees
+(define-type WAE
+  [num  (num number?)]
+  [add  (left WAE?) (right WAE?)]
+  [sub  (left WAE?) (right WAE?)]
+  [with (name symbol?) (init WAE?) (body WAE?)]
+  [id   (name symbol?)])
+
+; parse-sexpr : sexpr -> WAE
+;; to convert s-expressions into WAEs
+(define (parse-sexpr sexp)
+  (match sexp
+    [(? number?) (num sexp)]
+    [(list '+ l r) (add (parse-sexpr l) (parse-sexpr r))]
+    [(list '- l r) (sub (parse-sexpr l) (parse-sexpr r))]
+    [(list 'with (list x i) b) (with x (parse-sexpr i) (parse-sexpr b))]
+    [(? symbol?) (id sexp)]
+    [else (error 'parse "bad syntax: ~a" sexp)]))
+
+;; parses a string containing a WAE expression to a WAE AST
+(define (parse str)
+  (parse-sexpr (string->sexpr str)))
+
+;; substitutes the second argument with the third argument in the
+;; first argument, as per the rules of substitution; the resulting
+;; expression contains no free instances of the second argument
+(define (subst expr from to)
+  (type-case WAE expr
+    [num (n)   expr]
+    [add (l r) (add (subst l from to) (subst r from to))]
+    [sub (l r) (sub (subst l from to) (subst r from to))]
+    [id (name) (if (symbol=? name from) (num to) expr)]
+    [with (bound-id named-expr bound-body)
+          (with bound-id
+                (subst named-expr from to)
+                (if (symbol=? bound-id from)
+                    bound-body
+                    (subst bound-body from to)))]))
+
+;; evaluates WAE expressions by reducing them to numbers
+(define (eval expr)
+  (type-case WAE expr
+    [num (n) n]
+    [add (l r) (+ (eval l) (eval r))]
+    [sub (l r) (- (eval l) (eval r))]
+    [with (bound-id named-expr bound-body)
+          (eval (subst bound-body
+                       bound-id
+                       (eval named-expr)))]
+    [id (name) (error 'eval "free identifier: ~s" name)]))
+
+; run : string -> listof number
+;; evaluate a WAE program contained in a string
+(define (run str)
+  (eval (parse str)))
+
+;; tests
+(test (run "5") 5)
+(test (run "{+ 5 5}") 10)
+(test (run "{with {x {+ 5 5}} {+ x x}}") 20)
+(test (run "{with {x 5} {+ x x}}") 10)
+(test (run "{with {x {+ 5 5}} {with {y {- x 3}} {+ y y}}}") 14)
+(test (run "{with {x 5} {with {y {- x 3}} {+ y y}}}") 4)
+(test (run "{with {x 5} {+ x {with {x 3} 10}}}") 15)
+(test (run "{with {x 5} {+ x {with {x 3} x}}}") 8)
+(test (run "{with {x 5} {+ x {with {y 3} x}}}") 10)
+(test (run "{with {x 5} {with {y x} y}}") 5)
+(test (run "{with {x 5} {with {x x} x}}") 5)
+(test/exn (run "{with {x 1} y}") "free identifier")
+
+;; additional tests for complete coverage
+(test (run "{with {x 2} {- {+ x x} x}}") 2)
+(test/exn (run "{with x = 2 {+ x 3}}") "bad syntax")
+(test/exn (run "{bleh}") "bad syntax")
