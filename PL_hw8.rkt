@@ -32,6 +32,7 @@
 
 (test/exn (string->sexpr 1) "expects argument of type <string>")
 (test/exn (string->sexpr ".") "syntax error (bad contents)")
+(test/exn (string->sexpr "{} {}") "bad syntax (multiple expressions)")
 
 (define-type KCFAE
   [num (n number?)]
@@ -69,12 +70,11 @@
 
 ;; ----------------------------------------
 
-(define (rmv-last lst)
-  (cond [(null? lst) '()]
-        [(null? (cdr lst)) '()]
-        [else (cons (car lst) (rmv-last (cdr lst)))]))
-
 ;; parse : S-expr -> KCFAE
+;; parse s-expression to KCFAE type
+;; Test
+; (parse '(withcc k ((fun (x y) (- (+ x y) 2)) 2 (k 1)))) should produce
+; (withcc 'k (app (fun '(x y) (sub (add (id 'x) (id 'y)) (num 2))) (list (num 2) (app (id 'k) (list (num 1))))))
 (define (parse sexp)
   (cond
     [(number? sexp) (num sexp)]
@@ -92,6 +92,8 @@
        [(throw) (throw)]
        [else (app (parse (first sexp)) (map parse (rest sexp)))])]))
 
+(test (parse '(withcc k ((fun (x y) (- (+ x y) 2)) 2 (k 1)))) (withcc 'k (app (fun '(x y) (sub (add (id 'x) (id 'y)) (num 2))) (list (num 2) (app (id 'k) (list (num 1)))))))
+
 (define (parse-string str)
   (parse (string->sexpr str)))
 
@@ -107,6 +109,7 @@
 ;; ----------------------------------------
 
 ;; interp : KCFAE DefrdSub (KCFAE-Value -> alpha) -> alpha
+; (interp (withcc 'k (app (fun '(x y) (sub (add (id 'x) (id 'y)) (num 2))) (list (num 2) (app (id 'k) (list (num 1))))))) should produce (numV 1)
 (define (interp a-fae ds k)
   (type-case KCFAE a-fae
     [num (n) (k (numV n))]
@@ -149,17 +152,30 @@
                        (k v))))]
     [throw () (k (errorV))]))
 
+;; mod-defrdSub : KCFAE-Value list-of-KCFAE-Value (KCFAE-Value -> alpha) -> alpha
+;; given f-val, list of interpreted argument values and continuation, if given closureV, match the parameters with given argument values
+;; if given contV, apply the continuation to argument, if given error, apply continuation to error
+; (mod-defrdSub (closureV '(x y) (add (id 'x) (id 'y)) (mtSub)) (list (numV 3) (numV 4)) identity) should produce (numV 7)
+; (run "{{fun {x y} {- y x}} 10}") should produce "wrong arity"
+; (run "{try {{fun {x y} {- y x}} {throw} 3} catch 3}") should produce 3
+; (run "{3 2}") should produce "not a function"
 (define (mod-defrdSub f-val a-val k)
   (type-case KCFAE-Value f-val
     [closureV (param body-expr ds)
               (interp body-expr
-                      (if (= (length a-val) 0) ds
-                          (foldl aSub ds param a-val))
+                      (cond [(not (= (length a-val) (length param)))
+                             (error 'interp "wrong arity")]
+                            [(= (length a-val) 0) ds]
+                            [else (foldl aSub ds param a-val)])
                       k)]
     [contV (k!) (k! (first a-val))]
-    [errorV () (k (errorV))]
+    ;[errorV () (k (errorV))]
     [else (error 'interp "not a function")]))
 
+;; interp-fun: KCFAE-Value list-of-KCFAE DefrdSub (KCFAE-Value -> alpha) -> alpha
+;; interprete each arguments and pass the list of argument values to mod-defrdSub
+; (interp-fun (closureV '(x y) (add (id 'x) (id 'y)) (mtSub)) (list (num 3) (num 4)) '() (mtSub) identity) should return (numV 7)
+; (run "{withcc esc {try {+ {throw} {esc 3}} catch 4}}") should produce 4
 (define (interp-fun f-val args val-list ds k)
   (if (= (length args) 0)
       (mod-defrdSub f-val args k)
@@ -168,6 +184,7 @@
                 (cond [(errorV? a-val) (k a-val)]
                       [(= (length args) 1) (mod-defrdSub f-val (append val-list (list a-val)) k)]
                       [else (interp-fun f-val (rest args) (append val-list (list a-val)) ds k)])))))
+
 
 ;; num-op : (number number -> number) -> (KCFAE-Value KCFAE-Value -> KCFAE-Value)
 (define (num-op op op-name)
@@ -198,12 +215,24 @@
 (define (interp-expr a-fae)
   (type-case KCFAE-Value (interp a-fae (mtSub) (lambda (x) x))
     [numV (n) n]
-    [closureV (param body ds) 'function]
-    [contV (k) 'function]
-    [errorV () 'undefined]))
+    ;[closureV (param body ds) 'function]
+    ;[contV (k) 'function]
+    [errorV () 'undefined]
+    [else 'function]))
 
 (define (run str)
   (interp-expr (parse-string str)))
+
+;my test for interp
+(test (interp (withcc 'k (app (fun '(x y) (sub (add (id 'x) (id 'y)) (num 2))) (list (num 2) (app (id 'k) (list (num 1)))))) (mtSub) (lambda (x) x)) (numV 1))
+(test (run "{withcc esc {try {- {throw} {esc 3}} catch 4}}") 4)
+(test (mod-defrdSub (closureV '(x y) (add (id 'x) (id 'y)) (mtSub)) (list (numV 3) (numV 4)) (lambda (x) x)) (numV 7))
+(test/exn (run "{{fun {x y} {- y x}} 10}") "wrong arity")
+(test (run "{try {{fun {x y} {- y x}} {throw} 3} catch 3}") 3)
+(test/exn (run "{3 2}") "not a function")
+(test (interp-fun (closureV '(x y) (add (id 'x) (id 'y)) (mtSub)) (list (num 3) (num 4)) '() (mtSub) (lambda (x) x)) (numV 7))
+;(test (interp (id 'x) (aSub 'x (contV (lambda (x) x)) (mtSub)) (lambda (x) x)) 'function)
+(test (run "{throw}") 'undefined)
 
 ;;test
 (test (run "{{fun {x y} {- y x}} 10 12}") 2)
